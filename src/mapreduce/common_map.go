@@ -1,7 +1,6 @@
 package mapreduce
 
 import (
-	"bufio"
 	"encoding/json"
 	"hash/fnv"
 	"io/ioutil"
@@ -52,14 +51,12 @@ func doMap(
 	}
 	KeyValues := mapF(inFile, string(b))
 
-	writers := make([]*bufio.Writer, nReduce)
 	encoders := make([]*json.Encoder, nReduce)
 
 	for i := 0; i < nReduce; i++ {
 		fo, _ := os.Create(reduceName(jobName, mapTaskNumber, i))
 		defer fo.Close()
-		writers[i] = bufio.NewWriter(fo)
-		encoders[i] = json.NewEncoder(writers[i])
+		encoders[i] = json.NewEncoder(fo)
 	}
 
 	for _, kv := range KeyValues {
@@ -68,10 +65,6 @@ func doMap(
 		if err != nil {
 			log.Println(err)
 		}
-	}
-
-	for i := 0; i < nReduce; i++ {
-		writers[i].Flush()
 	}
 }
 

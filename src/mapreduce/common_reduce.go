@@ -65,9 +65,9 @@ func doReduce(
 	sort.Strings(keys)
 
 	of, _ := os.Create(mergeName(jobName, reduceTaskNumber))
+	defer of.Close()
 	encoder := json.NewEncoder(of)
 	for _, key := range keys {
 		encoder.Encode(KeyValue{key, reduceF(key, keyValuesMap[key])})
 	}
-	of.Close()
 }
