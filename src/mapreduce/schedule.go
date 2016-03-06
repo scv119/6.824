@@ -1,6 +1,8 @@
 package mapreduce
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // schedule starts and waits for all tasks in the given phase (Map or Reduce).
 func (mr *Master) schedule(phase jobPhase) {
@@ -21,8 +23,43 @@ func (mr *Master) schedule(phase jobPhase) {
 	// them have been completed successfully should the function return.
 	// Remember that workers may fail, and that any given worker may finish
 	// multiple tasks.
-	//
-	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-	//
+	taskChannel := make(chan int, ntasks)
+
+	for i := 0; i < ntasks; i++ {
+		if phase == mapPhase {
+			go func(idx int) {
+				var doTaskArgs DoTaskArgs
+				var reply struct{}
+				doTaskArgs.JobName = mr.jobName
+				doTaskArgs.File = mr.files[idx]
+				doTaskArgs.Phase = phase
+				doTaskArgs.TaskNumber = idx
+				doTaskArgs.NumOtherPhase = nios
+				worker := <-mr.registerChannel
+				call(worker, "Worker.DoTask", doTaskArgs, &reply)
+				taskChannel <- idx
+				mr.registerChannel <- worker
+			}(i)
+		} else {
+			go func(idx int) {
+				var doTaskArgs DoTaskArgs
+				var reply struct{}
+				doTaskArgs.JobName = mr.jobName
+				doTaskArgs.Phase = phase
+				doTaskArgs.TaskNumber = idx
+				doTaskArgs.NumOtherPhase = nios
+				worker := <-mr.registerChannel
+				call(worker, "Worker.DoTask", doTaskArgs, &reply)
+				taskChannel <- idx
+				mr.registerChannel <- worker
+			}(i)
+		}
+	}
+
+	for i := 0; i < ntasks; i++ {
+		v := <-taskChannel
+		fmt.Printf("Task %s number %d finsihed\n", phase, v)
+	}
+
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
