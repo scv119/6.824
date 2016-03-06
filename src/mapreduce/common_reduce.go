@@ -40,7 +40,8 @@ func doReduce(
 	keyValuesMap := make(map[string][]string)
 
 	for i := 0; i < nMap; i++ {
-		fo, err := os.Open(reduceName(jobName, i, reduceTaskNumber))
+		fo, err := os.OpenFile(reduceName(jobName, i, reduceTaskNumber),
+			os.O_RDWR|os.O_APPEND, 0666)
 		if err != nil {
 			panic(err)
 		}
@@ -57,7 +58,7 @@ func doReduce(
 	}
 
 	var keys []string
-	for key := range keyValuesMap {
+	for key, _ := range keyValuesMap {
 		keys = append(keys, key)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"io/ioutil"
+	"log"
 	"os"
 )
 
@@ -51,22 +52,26 @@ func doMap(
 	}
 	KeyValues := mapF(inFile, string(b))
 
-	outFiles := make([]*os.File, nReduce)
+	writers := make([]*bufio.Writer, nReduce)
 	encoders := make([]*json.Encoder, nReduce)
 
 	for i := 0; i < nReduce; i++ {
 		fo, _ := os.Create(reduceName(jobName, mapTaskNumber, i))
-		outFiles[i] = fo
-		encoders[i] = json.NewEncoder(bufio.NewWriter(fo))
+		defer fo.Close()
+		writers[i] = bufio.NewWriter(fo)
+		encoders[i] = json.NewEncoder(writers[i])
 	}
 
 	for _, kv := range KeyValues {
 		idx := ihash(kv.Key)
-		encoders[idx%uint32(nReduce)].Encode(&kv)
+		err := encoders[idx%uint32(nReduce)].Encode(&kv)
+		if err != nil {
+			log.Println(err)
+		}
 	}
 
-	for _, outFile := range outFiles {
-		outFile.Close()
+	for i := 0; i < nReduce; i++ {
+		writers[i].Flush()
 	}
 }
 
