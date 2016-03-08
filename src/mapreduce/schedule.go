@@ -35,10 +35,15 @@ func (mr *Master) schedule(phase jobPhase) {
 				doTaskArgs.Phase = phase
 				doTaskArgs.TaskNumber = idx
 				doTaskArgs.NumOtherPhase = nios
-				worker := <-mr.registerChannel
-				call(worker, "Worker.DoTask", doTaskArgs, &reply)
-				taskChannel <- idx
-				mr.registerChannel <- worker
+				for {
+					worker := <-mr.registerChannel
+					ok := call(worker, "Worker.DoTask", doTaskArgs, &reply)
+					if ok {
+						taskChannel <- idx
+						mr.registerChannel <- worker
+						break
+					}
+				}
 			}(i)
 		} else {
 			go func(idx int) {
@@ -48,10 +53,15 @@ func (mr *Master) schedule(phase jobPhase) {
 				doTaskArgs.Phase = phase
 				doTaskArgs.TaskNumber = idx
 				doTaskArgs.NumOtherPhase = nios
-				worker := <-mr.registerChannel
-				call(worker, "Worker.DoTask", doTaskArgs, &reply)
-				taskChannel <- idx
-				mr.registerChannel <- worker
+				for {
+					worker := <-mr.registerChannel
+					ok := call(worker, "Worker.DoTask", doTaskArgs, &reply)
+					if ok {
+						taskChannel <- idx
+						mr.registerChannel <- worker
+						break
+					}
+				}
 			}(i)
 		}
 	}
