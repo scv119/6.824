@@ -62,7 +62,9 @@ type Raft struct {
 	appendEntriesCount int
 	timeout            time.Duration
 	heartbeatChannel   chan bool
-	LeaderId           int
+	commandChannel     chan int
+
+	LeaderId int
 
 	term         int
 	voteFor      int
@@ -160,8 +162,8 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 
 type AppendEntriesArgs struct {
 	Term         int
-	LeaderId     int
-	PrefLogIndex int
+	LeaderID     int
+	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []Log
 	LeaderCommit int
@@ -174,9 +176,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Success = false
-	//fmt.Printf("Append Entries Received, Leader %d, node %d, term %d\n", args.LeaderId, rf.me, rf.term)
 	if args.Term < rf.term {
-		// fmt.Printf("Append Entries Rejected, Leader %d, node %d, term %d\n", args.LeaderId, rf.me, rf.term)
 		return
 	}
 	rf.appendEntriesCount++
@@ -185,7 +185,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	select {
 	case rf.heartbeatChannel <- true:
-		// fmt.Printf("Append Entries Received, Leader %d, node %d, term %d\n", args.LeaderId, rf.me, rf.term)
 	default:
 	}
 }
@@ -213,6 +212,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := rf.state == Leader
 
+	if !isLeader {
+		rf.log = append(rf.log, Log{Term: rf.term, Command: command})
+		term = rf.term
+		index = len(rf.log)
+		select {
+		// Notify that a new Command has been added into log. Noblocking
+		// as the routine might be busy.
+		case rf.commandChannel <- index:
+		default:
+		}
+	}
 	return index, term, isLeader
 }
 
@@ -227,7 +237,6 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) BecomeFollower() {
-	//fmt.Printf("Become Follower, node %d, term %d\n", rf.me, rf.term)
 	ticker := time.NewTicker(time.Millisecond * rf.timeout)
 	go func() {
 		appendEntriesCount := rf.appendEntriesCount
@@ -244,7 +253,6 @@ func (rf *Raft) BecomeFollower() {
 
 func (rf *Raft) BecomeCandidate() {
 	rf.term++
-	//fmt.Printf("Become Candidate, node %d, term %d\n", rf.me, rf.term)
 	rf.voteFor = rf.me
 	grantedNumber := 1
 	elected := false
@@ -288,51 +296,102 @@ func (rf *Raft) BecomeCandidate() {
 				return
 			}
 
-			// fmt.Printf("Expired, node %d, term %d\n", rf.me, rf.term)
-
 			expired = true
 			rf.stateChannel <- Candidate
 		case <-rf.heartbeatChannel:
 			usurped = true
 
-			// fmt.Printf("Usurped, node %d, term %d\n", rf.me, rf.term)
 			rf.stateChannel <- Follower
 		}
 	}()
 }
 
 func (rf *Raft) BecomeLeader() {
-	//fmt.Printf("Become Leader, node %d, term %d\n", rf.me, rf.term)
 	usurped := false
+	for i := range rf.matchIndex {
+		rf.matchIndex[i] = len(rf.log) + 1
+		rf.nextIndex[i] = 0
+	}
+
+	// Goroutine that sends heartbeat.
 	go func() {
 		ticker := time.NewTicker(time.Millisecond * time.Duration(10))
 		for range ticker.C {
 			if usurped {
 				break
 			}
-			for idx, _ := range rf.peers {
-				node_idx := idx
+			for idx := range rf.peers {
+				nodeIdx := idx
 				go func() {
-					if node_idx == rf.me {
+					if nodeIdx == rf.me {
 						return
 					}
-					//fmt.Printf("Sending AppendEntries from Leader %d to node %d with term %d\n", rf.me, idx, rf.term)
-					args := AppendEntriesArgs{Term: rf.term, LeaderId: rf.me}
+					lastLogIndex := len(rf.log)
+					prevLogTerm := 0
+					if lastLogIndex != 1 {
+						prevLogTerm = rf.log[lastLogIndex-2].term
+					}
+					args := AppendEntriesArgs{
+						Term:         rf.term,
+						LeaderID:     rf.me,
+						PrevLogIndex: lastLogIndex - 1,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      []Log{},
+						LeaderCommit: rf.commitIndex}
 					reply := AppendEntriesReply{}
-					rf.sendAppendEntries(node_idx, args, &reply)
+					rf.sendAppendEntries(nodeIdx, args, &reply)
 				}()
 			}
 		}
 		ticker.Stop()
 	}()
 
+	// Goroutine that listens to heartbeat from new Leader.
 	go func() {
 		<-rf.heartbeatChannel
 		usurped = true
 
-		// fmt.Printf("Usurped, node %d, term %d\n", rf.me, rf.term)
 		rf.stateChannel <- Follower
 	}()
+
+	// Goroutine that replicas log.
+	for idx := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+
+		for {
+			if usurped {
+				break
+			}
+			lastLogIndex := len(rf.log)
+			if lastLogIndex < rf.nextIndex[idx] {
+				break
+			}
+			prevLogTerm := 0
+			if lastLogIndex != 1 {
+				prevLogTerm = rf.log[lastLogIndex-2].term
+			}
+			args := AppendEntriesArgs{
+				Term:         rf.term,
+				LeaderID:     rf.me,
+				PrevLogIndex: lastLogIndex - 1,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      []Log{rf.log[lastLogIndex-1]},
+				LeaderCommit: rf.commitIndex}
+			reply := AppendEntriesReply{}
+			result := rf.sendAppendEntries(idx, args, reply)
+			if !result {
+				continue
+			}
+			if reply.Success {
+				rf.nextIndex[idx] = lastLogIndex + 1
+				rf.matchIndex[idx] = lastLogIndex
+			} else {
+				rf.nextIndex[idx]--
+			}
+		}
+	}
 }
 
 //
@@ -357,6 +416,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.stateChannel = make(chan int)
 	rf.heartbeatChannel = make(chan bool)
+	rf.commandChannel = make(chan int)
+	rf.matchIndex = []int{}
+	rf.nextIndex = []int{}
+	rf.log = []Log{}
 	// Your initialization code here.
 
 	go func() {
