@@ -62,13 +62,15 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	LeaderID                int
-	Timeout                 time.Duration
-	StateChannel            chan int
-	AppendEntriesRPCChannel chan bool
-	CurrentTerm             int
-	VotedFor                int
-	Log                     []Log
+	LeaderID          int
+	Timeout           time.Duration
+	StateChannel      chan int
+	HeartBeatChannel  chan bool
+	LogAppendChannel  chan int
+	LogCommitChannels []chan int
+	CurrentTerm       int
+	VotedFor          int
+	Log               []Log
 
 	// Volatile state on all servers.
 	CommitIndex int
@@ -136,13 +138,22 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
-
-	if args.Term < rf.CurrentTerm {
+	if args.Term < rf.CurrentTerm ||
+		rf.VotedFor >= 0 && rf.VotedFor != args.CandidateID {
 		return
 	}
 
-	reply.VoteGranted = true
-	rf.VotedFor = args.CandidateID
+	// Grant vote if the candidate is at least as up-to-date as me.
+	lastLogTerm := 0
+	lastLogIndex := 0
+	if len(rf.Log) > 0 {
+		lastLogTerm = rf.Log[len(rf.Log)-1].Term
+		lastLogIndex = len(rf.Log)
+	}
+	if args.LastLogTerm > lastLogTerm || args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		reply.VoteGranted = true
+		rf.VotedFor = args.CandidateID
+	}
 }
 
 //
@@ -184,19 +195,54 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Success = false
 	reply.Term = rf.CurrentTerm
+
 	if args.Term < rf.CurrentTerm {
 		return
 	}
 
+	// Heartbeat.
+	if len(args.Entries) != 0 {
+
+		// Reply false if log doesn't contain anentry at prevLogIndex whose term matches prevLogTerm.
+		if len(rf.Log) < args.PrevLogIndex || rf.Log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+			return
+		}
+
+		// Appending Logs.
+		logIndex := args.PrevLogIndex
+		for entriesIndex := 0; entriesIndex < len(args.Entries); entriesIndex++ {
+			if logIndex < len(rf.Log) {
+				// If an existing entry conficts with a new one, delete the existing entry and all that follow it.
+				if rf.Log[logIndex].Term != args.Entries[entriesIndex].Term {
+					rf.Log = rf.Log[:logIndex-1]
+				}
+			}
+
+			if logIndex >= len(rf.Log) {
+				rf.Log = append(rf.Log, args.Entries[entriesIndex])
+			}
+
+			logIndex++
+		}
+
+		if args.LeaderCommit > rf.CommitIndex {
+			if rf.CommitIndex = args.LeaderCommit; args.LeaderCommit < len(rf.Log) {
+				rf.CommitIndex = len(rf.Log)
+			}
+		}
+	}
+
+	// Since args.Term >= rf.CurrentTerm, this works for both follower and leaders as
+	// for leader, args.Term shoud > rf.CurrentTerm.
 	select {
-	case rf.AppendEntriesRPCChannel <- true:
+	case rf.HeartBeatChannel <- true:
 	default:
 	}
 
-	reply.Success = true
 	rf.CurrentTerm = args.Term
+	reply.Term = rf.CurrentTerm
+	reply.Success = true
 	rf.LeaderID = args.LeaderID
-
 }
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -219,10 +265,25 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
-
-	return index, term, isLeader
+	currentTerm, isLeader := rf.GetState()
+	if !isLeader {
+		return index, currentTerm, isLeader
+	}
+	rf.Log = append(rf.Log, Log{
+		Term:    rf.CurrentTerm,
+		Command: command,
+	})
+	logIndex := len(rf.Log)
+	rf.LogAppendChannel <- logIndex
+	commitChannel := make(chan int)
+	rf.LogCommitChannels = append(rf.LogCommitChannels, commitChannel)
+	for {
+		commitedLogIndex := <-commitChannel
+		if commitedLogIndex == logIndex {
+			break
+		}
+	}
+	return index, currentTerm, isLeader
 }
 
 //
@@ -256,9 +317,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here.
 	rf.Timeout = time.Duration(100 + rand.Intn(50))
 	rf.CurrentTerm = 0
+	rf.VotedFor = -1
+	rf.Log = []Log{}
+	rf.CommitIndex = 0
+	rf.LastApplied = 0
+	rf.NextIndex = make([]int, len(rf.peers))
+	rf.MatchIndex = make([]int, len(rf.peers))
 	rf.LeaderID = -1
 	rf.StateChannel = make(chan int)
-	rf.AppendEntriesRPCChannel = make(chan bool)
+	rf.HeartBeatChannel = make(chan bool)
+	rf.LogAppendChannel = make(chan int)
+	rf.LogCommitChannels = []chan int{}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -285,6 +354,8 @@ func (rf *Raft) serve() {
 }
 
 func (rf *Raft) asFollower() {
+	DPrintf("Node %v -> Follower, Term: %v\n", rf.me, rf.CurrentTerm)
+	rf.VotedFor = -1
 	ticker := time.NewTicker(time.Millisecond * rf.Timeout)
 	go func() {
 		timeout := true
@@ -297,7 +368,7 @@ func (rf *Raft) asFollower() {
 					return
 				}
 				timeout = true
-			case <-rf.AppendEntriesRPCChannel:
+			case <-rf.HeartBeatChannel:
 				timeout = false
 			}
 		}
@@ -306,6 +377,7 @@ func (rf *Raft) asFollower() {
 
 func (rf *Raft) asCandidate() {
 	rf.CurrentTerm++
+	DPrintf("Node %v -> Candidate, Term: %v\n", rf.me, rf.CurrentTerm)
 	rf.VotedFor = rf.me
 	grantedNumber := 1
 	elected := false
@@ -319,7 +391,17 @@ func (rf *Raft) asCandidate() {
 		}
 		idx := tmpIdx
 		go func() {
-			args := RequestVoteArgs{Term: rf.CurrentTerm, CandidateID: rf.me}
+			lastLogTerm := 0
+			if len(rf.Log) > 0 {
+				lastLogTerm = rf.Log[len(rf.Log)-1].Term
+			}
+
+			args := RequestVoteArgs{
+				Term:         rf.CurrentTerm,
+				CandidateID:  rf.me,
+				LastLogIndex: len(rf.Log),
+				LastLogTerm:  lastLogTerm,
+			}
 			reply := RequestVoteReply{}
 
 			if rf.sendRequestVote(idx, args, &reply) {
@@ -329,7 +411,10 @@ func (rf *Raft) asCandidate() {
 				}
 
 				if reply.VoteGranted {
+					DPrintf("Candidate %v request vote from %v succeed , Term: %v\n", rf.me, idx, rf.CurrentTerm)
 					grantedNumber++
+				} else {
+					DPrintf("Candidate %v request vote from %v failed , Term: %v\n", rf.me, idx, rf.CurrentTerm)
 				}
 
 				if grantedNumber >= len(rf.peers)/2+1 {
@@ -349,8 +434,8 @@ func (rf *Raft) asCandidate() {
 				return
 			}
 			expired = true
-			rf.StateChannel <- Candidate
-		case <-rf.AppendEntriesRPCChannel:
+			rf.StateChannel <- Follower
+		case <-rf.HeartBeatChannel:
 			usurped = true
 			rf.StateChannel <- Follower
 		}
@@ -358,8 +443,15 @@ func (rf *Raft) asCandidate() {
 }
 
 func (rf *Raft) asLeader() {
+	DPrintf("Node %v -> Leader, Term: %v\n", rf.me, rf.CurrentTerm)
 	rf.LeaderID = rf.me
 	usurped := false
+
+	for i := 0; i < len(rf.peers); i++ {
+		rf.NextIndex[i] = len(rf.Log) + 1
+		rf.MatchIndex[i] = 0
+	}
+
 	go func() {
 		ticker := time.NewTicker(time.Millisecond * time.Duration(10))
 		for range ticker.C {
@@ -372,9 +464,26 @@ func (rf *Raft) asLeader() {
 					if idx == rf.me {
 						return
 					}
-					args := AppendEntriesArgs{Term: rf.CurrentTerm, LeaderID: rf.me}
+					args := AppendEntriesArgs{
+						Term:         rf.CurrentTerm,
+						LeaderID:     rf.me,
+						LeaderCommit: rf.CommitIndex,
+						PrevLogIndex: -1,
+						PrevLogTerm:  -1,
+						Entries:      []Log{},
+					}
 					reply := AppendEntriesReply{}
+					if usurped {
+						return
+					}
 					rf.sendAppendEntries(idx, args, &reply)
+					//DPrintf("Leader %v , Term: %v, HeartBeat from %v: %v, %v\n",
+					//	rf.me, rf.CurrentTerm, idx, reply.Term, reply.Success)
+					if reply.Term > rf.CurrentTerm {
+						usurped = true
+						rf.CurrentTerm = reply.Term
+						rf.HeartBeatChannel <- true
+					}
 				}()
 			}
 		}
@@ -382,7 +491,7 @@ func (rf *Raft) asLeader() {
 	}()
 
 	go func() {
-		<-rf.AppendEntriesRPCChannel
+		<-rf.HeartBeatChannel
 		usurped = true
 		rf.StateChannel <- Follower
 	}()
