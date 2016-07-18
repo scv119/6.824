@@ -20,6 +20,7 @@ package raft
 import (
 	"labrpc"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -62,15 +63,14 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	LeaderID          int
-	Timeout           time.Duration
-	StateChannel      chan int
-	HeartBeatChannel  chan bool
-	LogAppendChannel  chan int
-	LogCommitChannels []chan int
-	CurrentTerm       int
-	VotedFor          int
-	Log               []Log
+	LeaderID         int
+	Timeout          time.Duration
+	StateChannel     chan int
+	HeartBeatChannel chan bool
+	ApplyCh          chan ApplyMsg
+	CurrentTerm      int
+	VotedFor         int
+	Log              []Log
 
 	// Volatile state on all servers.
 	CommitIndex int
@@ -193,18 +193,22 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.Success = false
+	reply.Success = true
 	reply.Term = rf.CurrentTerm
 
 	if args.Term < rf.CurrentTerm {
+		DPrintf("Node %v -> Follower, Term: %v, Reject\n", rf.me, rf.CurrentTerm)
+		reply.Success = false
 		return
 	}
 
 	// Heartbeat.
 	if len(args.Entries) != 0 {
 
-		// Reply false if log doesn't contain anentry at prevLogIndex whose term matches prevLogTerm.
-		if len(rf.Log) < args.PrevLogIndex || rf.Log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm.
+		if args.PrevLogIndex > 0 && (len(rf.Log) < args.PrevLogIndex || rf.Log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+			DPrintf("Node %v -> Follower, Term: %v, Reject\n", rf.me, rf.CurrentTerm)
+			reply.Success = false
 			return
 		}
 
@@ -224,11 +228,22 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 			logIndex++
 		}
+	}
 
-		if args.LeaderCommit > rf.CommitIndex {
-			if rf.CommitIndex = args.LeaderCommit; args.LeaderCommit < len(rf.Log) {
-				rf.CommitIndex = len(rf.Log)
-			}
+	toBeCommit := len(rf.Log)
+	if args.LeaderCommit < toBeCommit {
+		toBeCommit = args.LeaderCommit
+	}
+	for {
+		if rf.CommitIndex >= toBeCommit {
+			break
+		}
+
+		rf.CommitIndex++
+
+		rf.ApplyCh <- ApplyMsg{
+			Index:   rf.CommitIndex,
+			Command: rf.Log[rf.CommitIndex-1].Command,
 		}
 	}
 
@@ -238,6 +253,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	case rf.HeartBeatChannel <- true:
 	default:
 	}
+	//DPrintf("Node %v -> Follower, Term: %v, OK2\n", rf.me, rf.CurrentTerm)
 
 	rf.CurrentTerm = args.Term
 	reply.Term = rf.CurrentTerm
@@ -269,21 +285,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, currentTerm, isLeader
 	}
+	DPrintf("Node %v -> Leader, Term: %v, Start Command\n", rf.me, rf.CurrentTerm)
 	rf.Log = append(rf.Log, Log{
 		Term:    rf.CurrentTerm,
 		Command: command,
 	})
 	logIndex := len(rf.Log)
-	rf.LogAppendChannel <- logIndex
-	commitChannel := make(chan int)
-	rf.LogCommitChannels = append(rf.LogCommitChannels, commitChannel)
-	for {
-		commitedLogIndex := <-commitChannel
-		if commitedLogIndex == logIndex {
-			break
-		}
-	}
-	return index, currentTerm, isLeader
+	rf.MatchIndex[rf.me] = logIndex
+	rf.LastApplied = logIndex
+	return logIndex, currentTerm, true
 }
 
 //
@@ -326,8 +336,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LeaderID = -1
 	rf.StateChannel = make(chan int)
 	rf.HeartBeatChannel = make(chan bool)
-	rf.LogAppendChannel = make(chan int)
-	rf.LogCommitChannels = []chan int{}
+	rf.ApplyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -453,36 +462,107 @@ func (rf *Raft) asLeader() {
 	}
 
 	go func() {
+		for tmpIdx := range rf.peers {
+			idx := tmpIdx
+			go func() {
+				ticker := time.NewTicker(time.Millisecond * time.Duration(10))
+				for range ticker.C {
+					if usurped {
+						break
+					}
+
+					if idx == rf.me {
+						return
+					}
+
+					entries := []Log{}
+					prevLogIndex := 0
+					prevLogTerm := 0
+
+					if rf.LastApplied >= rf.NextIndex[idx] {
+						DPrintf("Node %v -> Leader, Term: %v, deciding %v, nextIdx %v, LastApplied %v \n", rf.me, rf.CurrentTerm, idx,
+							rf.NextIndex[idx], rf.LastApplied)
+						prevLogIndex = rf.NextIndex[idx] - 1
+						if prevLogIndex > 0 {
+							prevLogTerm = rf.Log[prevLogIndex-1].Term
+						}
+						entries = rf.Log[prevLogIndex:]
+					} else {
+						DPrintf("Node %v -> Leader, Term: %v, heart beat to %v \n", rf.me, rf.CurrentTerm, idx)
+					}
+
+					args := AppendEntriesArgs{
+						Term:         rf.CurrentTerm,
+						LeaderID:     rf.me,
+						LeaderCommit: rf.CommitIndex,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      entries,
+					}
+					reply := AppendEntriesReply{}
+					if usurped {
+						return
+					}
+					if rf.sendAppendEntries(idx, args, &reply) {
+						//DPrintf("Leader %v , Term: %v, HeartBeat from %v: %v, %v\n",
+						//	rf.me, rf.CurrentTerm, idx, reply.Term, reply.Success)
+
+						if !reply.Success {
+							if reply.Term > rf.CurrentTerm {
+								usurped = true
+								rf.CurrentTerm = reply.Term
+								rf.HeartBeatChannel <- true
+							} else if rf.NextIndex[idx] > 1 {
+
+								DPrintf("Node %v -> Leader, Term: %v, reply from %v: %v \n", rf.me, rf.CurrentTerm, idx, reply.Success)
+								rf.NextIndex[idx]--
+							}
+						} else if len(entries) > 0 {
+							rf.MatchIndex[idx] = rf.LastApplied
+							rf.NextIndex[idx] = rf.LastApplied + 1
+
+							DPrintf("Node %v -> Leader, Term: %v, Applied by %v, nextIdx %v, LastApplied %v \n", rf.me, rf.CurrentTerm, idx,
+								rf.NextIndex[idx], rf.LastApplied)
+						}
+					}
+				}
+				ticker.Stop()
+			}()
+		}
+	}()
+
+	go func() {
 		ticker := time.NewTicker(time.Millisecond * time.Duration(10))
 		for range ticker.C {
 			if usurped {
 				break
 			}
+
 			for tmpIdx := range rf.peers {
 				idx := tmpIdx
 				go func() {
 					if idx == rf.me {
 						return
 					}
+
 					args := AppendEntriesArgs{
 						Term:         rf.CurrentTerm,
 						LeaderID:     rf.me,
 						LeaderCommit: rf.CommitIndex,
-						PrevLogIndex: -1,
-						PrevLogTerm:  -1,
+						PrevLogIndex: 0,
+						PrevLogTerm:  0,
 						Entries:      []Log{},
 					}
 					reply := AppendEntriesReply{}
 					if usurped {
 						return
 					}
-					rf.sendAppendEntries(idx, args, &reply)
-					//DPrintf("Leader %v , Term: %v, HeartBeat from %v: %v, %v\n",
-					//	rf.me, rf.CurrentTerm, idx, reply.Term, reply.Success)
-					if reply.Term > rf.CurrentTerm {
-						usurped = true
-						rf.CurrentTerm = reply.Term
-						rf.HeartBeatChannel <- true
+					if rf.sendAppendEntries(idx, args, &reply) {
+						if !reply.Success && reply.Term > rf.CurrentTerm {
+							usurped = true
+							rf.CurrentTerm = reply.Term
+							rf.HeartBeatChannel <- true
+						}
 					}
 				}()
 			}
@@ -494,5 +574,30 @@ func (rf *Raft) asLeader() {
 		<-rf.HeartBeatChannel
 		usurped = true
 		rf.StateChannel <- Follower
+	}()
+
+	go func() {
+		ticker := time.NewTicker(time.Millisecond * time.Duration(10))
+		for range ticker.C {
+			if usurped {
+				break
+			}
+
+			matchIndexes := append(rf.MatchIndex[:rf.me], rf.MatchIndex[rf.me:]...)
+			sort.Sort(sort.Reverse(sort.IntSlice(matchIndexes)))
+			majority := matchIndexes[len(rf.peers)/2]
+			if majority > rf.CommitIndex && rf.Log[majority-1].Term == rf.CurrentTerm {
+				for ; rf.CommitIndex < majority; rf.CommitIndex++ {
+					DPrintf("Node %v, Commit Log %v \n", rf.me, rf.CommitIndex+1)
+					rf.ApplyCh <- ApplyMsg{
+						Index:   rf.CommitIndex + 1,
+						Command: rf.Log[rf.CommitIndex].Command,
+					}
+				}
+
+				DPrintf("Node %v, Commit Index %v \n", rf.me, rf.CommitIndex)
+			}
+		}
+		ticker.Stop()
 	}()
 }
